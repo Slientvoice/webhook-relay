@@ -1,5 +1,11 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+// 用环境变量连接 Upstash Redis
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL!,
+  token: process.env.KV_REST_API_TOKEN!
+});
 
 const PENDING_SET = 'webhook:pending';
 const LOG_LIST = 'webhook:log';
@@ -11,25 +17,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const action = req.query.action;
 
     if (action === 'pending') {
-      const ids = await kv.smembers(PENDING_SET);
+      const ids = await redis.smembers(PENDING_SET);
       if (ids.length === 0) {
         return res.json({ items: [] });
       }
-      const items = [];
+      const items: any[] = [];
       for (const id of ids.slice(0, 10)) {
-        const raw = await kv.get(`webhook:${id}`);
+        const raw = await redis.get(`webhook:${id}`);
         if (raw) {
           try {
             items.push({ id, ...(typeof raw === 'string' ? JSON.parse(raw) : raw) });
-          } catch { /* skip bad data */ }
+          } catch { /* skip */ }
         }
       }
       return res.json({ items });
     }
 
     if (action === 'stats') {
-      const pending = await kv.scard(PENDING_SET);
-      const logs = await kv.llen(LOG_LIST);
+      const pending = await redis.scard(PENDING_SET);
+      const logs = await redis.llen(LOG_LIST);
       return res.json({ pending, logs });
     }
 
@@ -46,7 +52,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (idemKey) {
-      const dup = await kv.get(`idem:${idemKey}`);
+      const dup = await redis.get(`idem:${idemKey}`);
       if (dup) {
         return res.json({ status: 'duplicate', id: dup });
       }
@@ -60,12 +66,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       webhook: body.webhook || null
     };
 
-    await kv.set(`webhook:${id}`, JSON.stringify(record));
-    await kv.sadd(PENDING_SET, id);
-    await kv.lpush(LOG_LIST, `${new Date().toISOString()} RECV ${id}`);
+    await redis.set(`webhook:${id}`, JSON.stringify(record));
+    await redis.sadd(PENDING_SET, id);
+    await redis.lpush(LOG_LIST, `${new Date().toISOString()} RECV ${id}`);
 
     if (idemKey) {
-      await kv.set(`idem:${idemKey}`, id);
+      await redis.set(`idem:${idemKey}`, id);
     }
 
     return res.json({ status: 'queued', id });
@@ -75,8 +81,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'DELETE') {
     const id = req.query.id as string;
     if (!id) return res.status(400).json({ error: 'missing id' });
-    await kv.srem(PENDING_SET, id);
-    await kv.lpush(LOG_LIST, `${new Date().toISOString()} DONE ${id}`);
+    await redis.srem(PENDING_SET, id);
+    await redis.lpush(LOG_LIST, `${new Date().toISOString()} DONE ${id}`);
     return res.json({ status: 'processed', id });
   }
 
