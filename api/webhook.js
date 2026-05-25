@@ -1,44 +1,29 @@
-import { Redis } from '@upstash/redis';
-
-let redisInstance = null;
-function getRedis() {
-  if (!redisInstance) {
-    redisInstance = new Redis({
-      url: process.env.KV_REST_API_URL,
-      token: process.env.KV_REST_API_TOKEN
-    });
-  }
-  return redisInstance;
-}
-
-const PENDING_SET = 'webhook:pending';
-const LOG_LIST = 'webhook:log';
+// 内存存储（零依赖，保证能跑）
+// 缺点：Vercel 冷启动时数据会丢失，但 CourtListener 会重试
+const store = new Map();  // key → value
+const pending = new Set(); // 待处理 ID 集合
+const logs = [];           // 最近日志
 
 export default async function handler(req, res) {
-  const r = getRedis();
 
-  // GET: 拉取待处理
+  // GET: OneDay 来拉取
   if (req.method === 'GET') {
-    const { action } = req.query;
+    const action = req.query.action;
+
     if (action === 'pending') {
-      const ids = await r.smembers(PENDING_SET);
-      if (ids.length === 0) return res.json({ items: [] });
-      const items = [];
-      for (const id of ids.slice(0, 10)) {
-        const raw = await r.get(`webhook:${id}`);
-        if (raw) {
-          try { items.push({ id, ...(typeof raw === 'string' ? JSON.parse(raw) : raw) }); } catch {}
-        }
-      }
+      const ids = [...pending].slice(0, 10);
+      const items = ids.map(id => ({ id, ...store.get(id) })).filter(Boolean);
       return res.json({ items });
     }
+
     if (action === 'stats') {
-      return res.json({ pending: await r.scard(PENDING_SET), logs: await r.llen(LOG_LIST) });
+      return res.json({ pending: pending.size, logs: logs.length });
     }
-    return res.json({ error: 'unknown action' });
+
+    return res.json({ status: 'ok', uptime: process.uptime() });
   }
 
-  // POST: 接收 webhook
+  // POST: CourtListener 发 webhook
   if (req.method === 'POST') {
     const body = req.body;
     const idemKey = req.headers['idempotency-key'];
@@ -47,30 +32,34 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'invalid payload' });
     }
 
-    if (idemKey) {
-      const dup = await r.get(`idem:${idemKey}`);
-      if (dup) return res.json({ status: 'duplicate', id: dup });
+    // 幂等去重
+    if (idemKey && store.has(`idem:${idemKey}`)) {
+      return res.json({ status: 'duplicate', id: store.get(`idem:${idemKey}`) });
     }
 
-    const id = `wh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    await r.set(`webhook:${id}`, JSON.stringify({
+    const id = `wh_${Date.now()}`;
+    store.set(id, {
       receivedAt: new Date().toISOString(),
       idempotencyKey: idemKey || null,
       payload: body.payload,
       webhook: body.webhook || null
-    }));
-    await r.sadd(PENDING_SET, id);
-    await r.lpush(LOG_LIST, `${new Date().toISOString()} RECV ${id}`);
-    if (idemKey) await r.set(`idem:${idemKey}`, id);
+    });
+    pending.add(id);
+    logs.push(`RECV ${id} entries=${body.payload.results.length}`);
+    if (logs.length > 100) logs.shift();
+
+    if (idemKey) store.set(`idem:${idemKey}`, id);
 
     return res.json({ status: 'queued', id });
   }
 
-  // DELETE: 标记已处理
+  // DELETE: OneDay 通知已处理
   if (req.method === 'DELETE') {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: 'missing id' });
-    await r.srem(PENDING_SET, id);
+    pending.delete(id);
+    store.delete(id);
+    logs.push(`DONE ${id}`);
     return res.json({ status: 'processed', id });
   }
 
