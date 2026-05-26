@@ -117,9 +117,6 @@ module.exports = async function handler(req, res) {
       if (a === 'stats') {
         return res.json({ pending: pending.size });
       }
-      if (a === 'v') {
-        return res.json({ v: '2.0-direct', commit: '6ebf5e6' });
-      }
       return res.json({ ok: true });
     }
 
